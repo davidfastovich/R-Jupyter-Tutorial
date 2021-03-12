@@ -1,0 +1,154 @@
+---
+title: "NeotomaR Example"
+output:
+  html_document:
+    theme: united
+    highlight: tango
+    toc: true
+    toc_float: true
+author: David Fastovich
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Accessing the Neotoma Paleoecology Database from R
+
+Neotoma has a robust application programming interface (API) that is tightly integrated into the `neotoma` R package. This API makes calls to the constituent Neotoma databases and returns JSON files, enabling API queries in other languages like Python or even shell scripts (e.g. `curl`, `wget`). Below are links to the relevant API documentation and two examples for calling all metadata for a single site and then retreiving all ecological data from that site.
+
+[API Documentation](https://api.neotomadb.org/api-docs/)
+
+[Devils Lake, WI Metadata](https://api-dev.neotomadb.org/v1.5/data/sites/666) where the `666` corresponds to the unique Site ID
+
+[Devils Lake, WI Fossil Pollen Abundance](https://api-dev.neotomadb.org/v1.5/data/downloads/684) where the `684` corresponds to the unique Dataset ID for this fossil-pollen abundance data table.
+
+
+```{r message=FALSE, warning=FALSE}
+## If a package is installed, it will be loaded. If any 
+## are not, the missing package(s) will be installed 
+## from CRAN and then loaded.
+
+## First specify the packages of interest
+packages = c("neotoma", "ggplot2", "leaflet", "reshape2", "Bchron")
+
+## Now load or install&load all
+package.check <- lapply(
+  packages,
+  FUN = function(x) {
+    if (!require(x, character.only = TRUE)) {
+      install.packages(x, dependencies = TRUE)
+      library(x, character.only = TRUE)
+    }
+  }
+)
+```
+
+## Querying a single site using the `neotoma` R Package
+
+This walkthrough provides a primer on the data structures returned by `neotoma`, namely data.tables and nested lists.
+
+```{r message=FALSE}
+# Make a call for all sites with Devils Lake in their names - RETURNS RELEVANT SITE IDS
+devils <- get_site(sitename = "Devils Lake")
+
+# List all unique Site IDs - only interested in Devil's Lake, WI
+# The general structure of most objected returned by the neotoma R package is either
+# data.frames or nested lists.
+# 
+# Print all Site ID's and get site 666
+devils$site.id
+
+# Download all data for site 666 - row 1 contains the same fossil-pollen data we queried above
+devils_dataset_id <- get_dataset(devils[1,]) # RETURNS RELEVANT DATASET IDS IN A NESTED LIST
+
+# Now with the Dataset IDs in hand, lets download fossil-pollen data for Devils Lake, WI and plot
+devils_pollen <- get_download(devils_dataset_id[[1]])
+
+# Plot fossil-pollen abundances using simple function that returns ggplot object
+plot_dataset <- function(dataset){
+  
+  # Convert to proportions
+  dataset_proportion <- as.data.frame(dataset$counts/rowSums(dataset$counts))
+  
+  # Keep taxa that have a minimum average abundance > 5%
+  dataset_proportion <- dataset_proportion[,colMeans(dataset_proportion) > .05]
+  
+  # Attach ages
+  dataset_proportion$age <- unlist(dataset$sample.meta$age)
+  
+  # Converting to a narrow data format
+  dataset_melt <- melt(dataset_proportion, id.vars = "age")
+  
+  poll_plot <- ggplot(data = dataset_melt, aes(x = age, y = value)) +
+    geom_line() + 
+    scale_x_reverse() + 
+    facet_wrap(~variable, scales = "free_y", nrow = ncol(dataset_proportion))
+  
+  return(poll_plot + theme_bw())
+}
+
+plot_dataset(devils_pollen[[1]])
+```
+
+## Running an age model from chronological control data
+
+The `get_chroncontrol` returns a nested list of age controls for a specified dataset. Let's use this funciton on the dataset of fossil-pollen abundances that we just retrieved and visualized. 
+
+```{r message=FALSE, results='hide'}
+# Returns uncalibrated radiocarbon dates
+devils_chron_ctrl <- get_chroncontrol(devils_dataset_id[[1]])
+
+# Use BChron to create a new chronology
+new_chron <- Bchronology(ages   = devils_chron_ctrl[[1]]$chron.control$age, # Uncalibrated ages
+                         ageSds = devils_chron_ctrl[[1]]$chron.control$age - devils_chron_ctrl[[1]]$chron.control$age.young, # Calculating error as the difference from `age.young`
+                         positions = devils_chron_ctrl[[1]]$chron.control$depth, # Depth
+                         positionThicknesses = devils_chron_ctrl[[1]]$chron.control$thickness, # Thickness of sample
+                         calCurves = c(rep("intcal20", length(devils_chron_ctrl[[1]]$chron.control$age) - 2), "normal", "normal")) # Calibration to apply
+
+plot(new_chron)
+```
+
+## Querying all sites with data between a time interval
+
+Here, we will query Neotoma to return all sites in eastern North America with fossil-pollen data from 20,000 ka to 1,000 ka. With all sites retrieved, we can place the same process that we followed for Devils Lake above in a loop to return each fossil-pollen record, plot it, and rebuild the age-depth model. It takes a *very* long time to download 658 sites worth of data, so I will leave this as a leaflet plot to visualize all sites retrieved.
+
+```{r message=FALSE}
+# Make API call
+ena_sites <- get_dataset(datasettype = "pollen", # Data type
+                         loc = c(-92, 20, -50, 60), # Define bounding box
+                         ageyoung = 1000, # Minimum age for search
+                         ageold = 20000) # Maximum age for search
+
+# Function to make leaflet plot - from Simon Goring
+# http://www.goring.org/resources/neotoma_lab_meeting.html
+leaflet_map <- function(dataset_in) {
+  dataset_summary <- do.call(rbind, lapply(dataset_in, 
+                        function(x){
+                          # here we pull out the site information from the `dataset` objects:
+                          data.frame(name = x$site.data$site.name,
+                                     lat  = x$site.data$lat + runif(1, -0.005, 0.005),
+                                     long = x$site.data$long + runif(1, -0.005, 0.005),
+                                     type = x$dataset.meta$dataset.type)
+                        }))
+  
+  # The leaflet package documentation uses piping.  For the sake of this tutorial, I won't.
+  # First, define a color palette for the dataset type symbol plotting.
+  pal <- leaflet::colorFactor("Dark2", domain = levels(dataset_summary$type))
+  
+  # Now make the leaflet map, add base raster tiles and then add the markers for the records:
+  map <- leaflet(data = dataset_summary)
+  map <- leaflet::addTiles(map)
+  map <- leaflet::addCircleMarkers(map, ~long, ~lat, 
+                                   popup = ~paste0("Site: ", as.character(name), "<br>",
+                                                   "Type: ", 
+                                                   as.character(dataset_summary$type)),
+                                   color = ~pal(type),
+                                   stroke = FALSE, fillOpacity = 0.5)
+  # You need to explicitly call the `map` object to make it appear!
+  map
+}
+
+leaflet_map(ena_sites)
+```
